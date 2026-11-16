@@ -28,10 +28,16 @@ fn make_data(n: i64, noise: f64, r: rng&, xs: u64[>..]&, ys: u8[>..]&) {
     }
 }
 
+// The binary machine says 1 when its vote sum is not negative.
+fn predict(m: tm::TM&, x: u64[:]) -> i64 {
+    tm::evaluate(m, x, false);
+    return if tm::class_sum(m, 0) >= 0 { 1 } else { 0 };
+}
+
 fn accuracy(m: tm::TM&, xs: u64[:], ys: u8[:]) -> f64 {
     var correct = 0;
     for i in ys.len {
-        if tm::predict(m, xs[i * N_WORDS..(i + 1) * N_WORDS]) == ys[i] { correct++; }
+        if predict(m, xs[i * N_WORDS..(i + 1) * N_WORDS]) == ys[i] { correct++; }
     }
     return correct as f64 / ys.len;
 }
@@ -46,11 +52,11 @@ fn main() {
     make_data(N_TEST, 0.0, r, x_test, y_test);
 
     var m = tm::TM { .. };
-    tm::init(m, N_FEATURES, N_CLAUSES, N_STATES, THRESHOLD, SPECIFICITY, r);
+    tm::init(m, N_FEATURES, 1, N_CLAUSES, N_STATES, THRESHOLD, SPECIFICITY, r);   // one class: a binary machine
 
     for epoch in 1..EPOCHS + 1 {
         for i in N_TRAIN {
-            tm::update(m, x_train[i * N_WORDS..(i + 1) * N_WORDS], y_train[i], r);
+            tm::update_class(m, 0, x_train[i * N_WORDS..(i + 1) * N_WORDS], y_train[i], r);
         }
         if epoch % 10 == 0 || epoch == 1 {
             print("epoch ", epoch, ": train ", accuracy(m, x_train, y_train), " test ", accuracy(m, x_test, y_test));

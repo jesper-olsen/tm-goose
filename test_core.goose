@@ -2,7 +2,7 @@ import tm;
 
 // Builds a machine with n features, c clauses, N = 10, T = 5 and every state set to `st`.
 fn setup(m: tm::TM&, n: i64, c: i64, s: f64, st: u8, r: rng&) {
-    tm::init(m, n, c, 10, 5, s, r);
+    tm::init(m, n, 1, c, 10, 5, s, r);
     for i in m.state.len { m.state[i] = st; }
     tm::rebuild_masks(m);
 }
@@ -44,17 +44,17 @@ fn main() {
 
     // --- class sum: even clauses +, odd -, clipped to +-T (T = 5)
     tm::evaluate(m, xp, false);               // outputs 1, 0, 1, 1
-    check("class sum = +1 -0 +1 -1 = 1", tm::class_sum(m) == 1);
+    check("class sum = +1 -0 +1 -1 = 1", tm::class_sum(m, 0) == 1);
     let b1: u8[1] = [1];
     var bp: u64[>..] = [];
     tm::pack(b1, bp);
     var big = tm::TM { .. }; setup(big, 1, 14, 2.0, 5, r);     // 14 empty clauses
     tm::evaluate(big, bp, true);            // all 1: 7 - 7 = 0
-    check("balanced sum is 0", tm::class_sum(big) == 0);
+    check("balanced sum is 0", tm::class_sum(big, 0) == 0);
     for j in 14 { if j % 2 == 1 { big.out[j] = 0; } }
-    check("clipped to +T", tm::class_sum(big) == 5);        // 7 positive, clipped
+    check("clipped to +T", tm::class_sum(big, 0) == 5);        // 7 positive, clipped
     for j in 14 { big.out[j] = (j % 2) as u8; }
-    check("clipped to -T", tm::class_sum(big) == -5);
+    check("clipped to -T", tm::class_sum(big, 0) == -5);
 
     // --- Type II: clause fired -> every excluded false literal moves up by one, nothing else
     var t2 = tm::TM { .. }; setup(t2, 2, 2, 2.0, 5, r);
@@ -107,9 +107,9 @@ fn main() {
     var u = tm::TM { .. }; setup(u, 2, 14, 1.0e12, 5, r);
     for j in 3..14 { if j % 2 == 1 { set(u, j, 1, 11); } }
     let before = copy(u.state);
-    tm::update(u, xp, 1, r);                                  // y = 1, v = T: p = 0, nothing may change
+    tm::update_class(u, 0, xp, 1, r);                                  // y = 1, v = T: p = 0, nothing may change
     check("update y=1 at v=+T changes nothing", u.state == before);
-    tm::update(u, xp, 0, r);                                  // y = 0, v = +T: p = 1, every clause gets feedback
+    tm::update_class(u, 0, xp, 0, r);                                  // y = 0, v = +T: p = 1, every clause gets feedback
     check("y=0, v=+T: positive clause 0 got type II (false x1 5 -> 6)", get(u, 0, 1) == 6);
     check("y=0, v=+T: positive clause 0 type II leaves true x0 alone", get(u, 0, 0) == 5);
     check("y=0, v=+T: negative clause 1 got type I (true x0 5 -> 6)", get(u, 1, 0) == 6);
@@ -122,9 +122,9 @@ fn main() {
     var w = tm::TM { .. }; setup(w, 2, 14, 1.0e12, 5, r);
     for j in 2..14 { if j % 2 == 0 { set(w, j, 1, 11); } }
     let before_w = copy(w.state);
-    tm::update(w, xp, 0, r);                                  // y = 0, v = -T: p = 0
+    tm::update_class(w, 0, xp, 0, r);                                  // y = 0, v = -T: p = 0
     check("update y=0 at v=-T changes nothing", w.state == before_w);
-    tm::update(w, xp, 1, r);                                  // y = 1, v = -T: p = 1
+    tm::update_class(w, 0, xp, 1, r);                                  // y = 1, v = -T: p = 1
     check("y=1, v=-T: positive clause 0 got type I (true x0 5 -> 6)", get(w, 0, 0) == 6);
     check("y=1, v=-T: negative clause 1 got type II (false x1 5 -> 6)", get(w, 1, 1) == 6);
     check("y=1, v=-T: negative clause 1 type II leaves true x0 alone", get(w, 1, 0) == 5);
@@ -147,7 +147,7 @@ fn main() {
     var fired = 0;
     for n in [1, 2, 63, 64, 65, 127, 128, 129, 200] {
         var p = tm::TM { .. };
-        tm::init(p, n, 12, 3, 5, 2.0, r);                  // N = 3: random states 1..6, about half included
+        tm::init(p, n, 1, 12, 3, 5, 2.0, r);                  // N = 3: random states 1..6, about half included
         for trial in 40 {
             // sparse inclusion makes firing clauses likely: reset most automata to "exclude"
             for i in p.state.len { p.state[i] = if r.rand_int(12) == 0 { 4 + r.rand_int(3) as u8 } else { 1 + r.rand_int(3) as u8 }; }
@@ -177,18 +177,93 @@ fn main() {
 
     // --- masks follow the states through training, including across the include boundary
     var q = tm::TM { .. };
-    tm::init(q, 70, 6, 4, 4, 2.0, r);
+    tm::init(q, 70, 1, 6, 4, 4, 2.0, r);
     var consistent = true;
     for step in 400 {
         var bits: u8[>..] = [];
         for _ in 70 { bits.push(r.rand_int(2) as u8); }
         var xq: u64[>..] = [];
         tm::pack(bits, xq);
-        tm::update(q, xq, bits[0] ^ bits[1], r);
+        tm::update_class(q, 0, xq, bits[0] ^ bits[1], r);
         let saved = copy(q.inc);
         tm::rebuild_masks(q);
         if q.inc != saved { consistent = false; }
     }
     check("masks equal the ones rebuilt from the states after 400 updates", consistent);
+
+    // ===================================================== several classes
+    // --- classes own disjoint clause ranges; polarity restarts in every class
+    // (3 clauses per class, so the parity of the global index differs from the in-class one)
+    var mc = tm::TM { .. };
+    tm::init(mc, 2, 3, 3, 10, 5, 2.0, r);                     // 2 features, 3 classes, 3 clauses each
+    for i in mc.state.len { mc.state[i] = 5; }
+    tm::rebuild_masks(mc);
+    for j in 3..6 { set(mc, j, 0, 11); }                       // class 1: every clause includes x0
+    set(mc, 6, 0, 11); set(mc, 7, 0, 11); set(mc, 8, 1, 11);  // class 2: x0, x0, x1
+    tm::evaluate(mc, xp, false);                               // x = (1, 0)
+    check("class 0 (all clauses empty) scores 0", tm::class_sum(mc, 0) == 0);
+    check("class 1 scores +1 -1 +1 = 1 (polarity restarts per class)", tm::class_sum(mc, 1) == 1);
+    check("class 2 scores +1 -1 +0 = 0", tm::class_sum(mc, 2) == 0);
+    check("predict is the highest score", tm::predict(mc, xp) == 1);
+    set(mc, 8, 1, 5); set(mc, 8, 0, 11);                       // class 2 now also scores +1
+    check("ties go to the lowest class", tm::predict(mc, xp) == 1 && tm::class_sum(mc, 2) == 1);
+    var quiet = tm::TM { .. };
+    tm::init(quiet, 2, 3, 3, 10, 5, 2.0, r);
+    for i in quiet.state.len { quiet.state[i] = 5; }
+    tm::rebuild_masks(quiet);
+    check("all scores equal -> class 0", tm::predict(quiet, xp) == 0);
+
+    // --- evaluate_class writes only its own class's outputs
+    for j in mc.out.len { mc.out[j] = 7; }
+    tm::evaluate_class(mc, 1, xp, false);
+    var only_own = true;
+    for j in 9 { if (j >= 3 && j < 6) == (mc.out[j] == 7) { only_own = false; } }
+    check("evaluate_class touches exactly clauses 3..6 of 9", only_own);
+
+    // --- negative_class: never the target, uniform over the others
+    var four = tm::TM { .. };
+    tm::init(four, 2, 4, 2, 10, 5, 2.0, r);
+    var cnt: i64[4] = [0; 4];
+    for _ in 4000 { cnt[tm::negative_class(four, 2, r)] += 1; }
+    check("negative_class never returns the target", cnt[2] == 0);
+    check("negative_class is uniform over the other classes",
+          cnt[0] > 1150 && cnt[0] < 1520 && cnt[1] > 1150 && cnt[1] < 1520 && cnt[3] > 1150 && cnt[3] < 1520);
+
+    // --- update: the target class and exactly one other class receive feedback.
+    // x = (1, 0, 1, 0), T = 1, s huge. The target class is set to v = -T (so y = 1 has p = 1, and
+    // its firing negative clause gets type II); every other class to v = +T (so y = 0 has p = 1,
+    // and its firing positive clause gets type II).
+    let xb: u8[4] = [1, 0, 1, 0];
+    var xb_p: u64[>..] = [];
+    tm::pack(xb, xb_p);
+    var uc = tm::TM { .. };
+    tm::init(uc, 4, 3, 2, 10, 1, 1.0e12, r);
+    let per_class = 2 * 2 * 4;                                 // clauses * 2 * features
+    var changed_by_class: i64[3] = [0; 3];
+    var bad = 0;
+    for trial in 300 {
+        let t = trial % 3;
+        for i in uc.state.len { uc.state[i] = 5; }
+        for c in 3 {
+            if c == t { uc.state[(c * 2) * 8 + 1] = 11; } else { uc.state[(c * 2 + 1) * 8 + 1] = 11; }
+        }
+        tm::rebuild_masks(uc);
+        let before = copy(uc.state);
+        tm::update(uc, xb_p, t, r);
+        var n_changed = 0;
+        var target_changed = false;
+        for c in 3 {
+            var differs = false;
+            for i in c * per_class..(c + 1) * per_class { if uc.state[i] != before[i] { differs = true; } }
+            if differs {
+                n_changed++;
+                if c == t { target_changed = true; } else { changed_by_class[c] += 1; }
+            }
+        }
+        if n_changed != 2 || !target_changed { bad++; }
+    }
+    check("update changes the target class and exactly one other class, every time", bad == 0);
+    check("every class is drawn as the negative (300 trials, 100 per target)",
+          changed_by_class[0] > 50 && changed_by_class[1] > 50 && changed_by_class[2] > 50);
     print("all checks passed");
 }
