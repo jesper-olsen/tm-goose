@@ -13,6 +13,101 @@ fn set(m: tm::TM&, j: i64, k: i64, st: u8) {
 }
 fn get(m: tm::TM&, j: i64, k: i64) -> u8 { m.state[j * 2 * m.n_features + k] }
 
+
+// Runs `trials` Type I updates on an unfired one-clause machine whose 2 * n literals all start just
+// inside "include" (state N + 1) and compares how they move with independent coin flips of
+// probability p = 1 / s: per position (or per group of positions when moves are rare), the number
+// of moves per trial (mean and variance) and the correlation between literals 1, 2 and 7 apart.
+fn check_decay(n: i64, s: f64, trials: i64, r: rng&) {
+    var m = tm::TM { .. };
+    tm::init(m, n, 1, 1, 10, 5, s, r);                      // N = 10: states 11 (include) -> 10 (exclude)
+    var zeros: u8[>..] = [];
+    for _ in n { zeros.push(0); }
+    var x: u64[>..] = [];
+    tm::pack(zeros, x);
+    let len = 2 * n;
+    let p = tm::decay_probability(s);                       // 1/s, rounded to a multiple of 2^-16 when flipping 64 coins at a time
+    let q = 1.0 - p;
+    var counts: i64[>..] = [];
+    counts.resize(len, 0);
+    var moved: u8[>..] = [];
+    moved.resize(len, 0);
+    var total = 0.0;
+    var total_sq = 0.0;
+    var pairs: i64[4] = [0; 4];
+    let lags: i64[4] = [1, 2, 7, 64];                         // 64: the same coin in the next word
+    var consistent = true;
+    for _ in trials {
+        for i in m.state.len { m.state[i] = 11; }
+        tm::rebuild_masks(m);
+        m.out[0] = 0;                                         // the clause did not fire
+        tm::type_i(m, 0, x, r);
+        var c = 0;
+        for k in len {
+            let st = m.state[k];
+            let mv = st == 10;
+            moved[k] = if mv { 1 } else { 0 };
+            if mv { counts[k] += 1; c++; }
+            if st != 10 && st != 11 { consistent = false; }
+            if tm::included(m, 0, k) != (st == 11) { consistent = false; }
+        }
+        total += c;
+        total_sq += c * c;
+        for li in 4 {
+            if len > lags[li] {
+                for k in len - lags[li] { pairs[li] += moved[k] * moved[k + lags[li]]; }
+            }
+        }
+    }
+    let t = trials * 1.0;
+    let tag = str("decay n=", n, " s=", s, ": ");
+
+    check(str(tag, "states stay in {N, N+1} and the masks agree"), consistent);
+    if q <= 0.0 {                                          // p = 1: every literal moves, every time
+        var all = true;
+        for k in len { if counts[k] != trials { all = false; } }
+        check(str(tag, "p = 1: every literal moves in every trial"), all);
+        return;
+    }
+
+    // frequency per position (grouped when moves are rare, so that each group sees plenty of them)
+    let groups = if t * p >= 100.0 { len } else { min(len, 16) };
+    var worst = 0.0;
+    for g in groups {
+        let lo = g * len / groups;
+        let hi = (g + 1) * len / groups;
+        var obs = 0;
+        for k in lo..hi { obs += counts[k]; }
+        let cells = (hi - lo) * t;
+        let z = abs(obs - cells * p) / sqrt(cells * p * q);
+        if z > worst { worst = z; }
+    }
+    check(str(tag, "move frequency per position, worst |z| = ", worst), worst < 5.5);
+
+    // moves per trial: mean len * p, variance len * p * q (binomial)
+    let mean = total / t;
+    let var_obs = (total_sq - t * mean * mean) / (t - 1.0);
+    let mu = len * p;
+    let sigma2 = len * p * q;
+    let z_mean = abs(mean - mu) / sqrt(sigma2 / t);
+    let excess = (1.0 - 6.0 * p * q) / sigma2;                 // excess kurtosis of the binomial
+    let se_var = sigma2 * sqrt(2.0 / (t - 1.0) + excess / t);
+    let z_var = abs(var_obs - sigma2) / se_var;
+    check(str(tag, "moves per trial: mean ", mean, " vs ", mu, ", |z| = ", z_mean), z_mean < 5.5);
+    check(str(tag, "moves per trial: variance ", var_obs, " vs ", sigma2, ", |z| = ", z_var), z_var < 5.5);
+
+    // two literals a few places apart, or a word apart, move together with probability p^2 (variance inflated for overlapping pairs)
+    var worst_pair = 0.0;
+    for li in 4 {
+        let cells = (len - lags[li]) * t;
+        if len > lags[li] && cells * p * p >= 30.0 {
+            let z = abs(pairs[li] - cells * p * p) / sqrt(2.0 * cells * p * p * (1.0 - p * p));
+            if z > worst_pair { worst_pair = z; }
+        }
+    }
+    check(str(tag, "joint moves at lags 1, 2, 7 and 64, worst |z| = ", worst_pair), worst_pair < 5.5);
+}
+
 fn main() {
     var r = rng { 7 };
     // two features: literals are [x0, x1, !x0, !x1]
@@ -265,5 +360,35 @@ fn main() {
     check("update changes the target class and exactly one other class, every time", bad == 0);
     check("every class is drawn as the negative (300 trials, 100 per target)",
           changed_by_class[0] > 50 && changed_by_class[1] > 50 && changed_by_class[2] > 50);
+
+    // ============================================ sampling of the decay of an unfired clause
+    // Each literal of a clause that did not fire must move towards "exclude" with probability 1/s,
+    // independently of the others, however that is sampled.
+    check("ln_one_minus matches ln(1 - p): 0.5", abs(tm::ln_one_minus(0.5) - log(0.5)) < 1.0e-15);
+    check("ln_one_minus matches ln(1 - p): 1e-3", abs(tm::ln_one_minus(1.0e-3) / log(1.0 - 1.0e-3) - 1.0) < 1.0e-12);
+    check("ln_one_minus for tiny p: 1e-9", abs(tm::ln_one_minus(1.0e-9) / -1.0000000005e-9 - 1.0) < 1.0e-12);
+    // either side of the point where it switches from the series to log(1 - p), against a 4-term series
+    for p in [0.99999e-4, 1.00001e-4] {
+        let series = -(p + p * p / 2.0 + p * p * p / 3.0 + p * p * p * p / 4.0);
+        check(str("ln_one_minus agrees with the series near the switch, p = ", p), abs(tm::ln_one_minus(p) / series - 1.0) < 1.0e-11);
+    }
+    check("decay probability: s = 10 is 6554 / 65536 (coins flipped 64 at a time)", tm::decay_probability(10.0) == 6554.0 / 65536.0);
+    check("decay probability: s = 32 is exactly 1/32", tm::decay_probability(32.0) == 1.0 / 32.0);
+    check("decay probability: s = 100 is exactly 1/100 (gaps)", tm::decay_probability(100.0) == 1.0 / 100.0);
+    check("decay probability: s just above 1 rounds to 1", tm::decay_probability(1.0000001) == 1.0);
+    check_decay(1, 2.0, 20000, r);            // the smallest clause: 2 literals
+    check_decay(3, 1.0000001, 2000, r);       // p ~ 1: everything moves
+    check_decay(3, 1.0e12, 2000, r);          // p ~ 0: nothing moves
+    check_decay(100, 1.25, 20000, r);         // p = 0.8
+    check_decay(100, 2.0, 20000, r);          // p = 0.5
+    check_decay(100, 3.9, 20000, r);          // p = 0.256
+    check_decay(100, 10.0, 20000, r);         // p = 0.1
+    check_decay(100, 31.0, 20000, r);         // the last s that flips coins 64 at a time, below s = 32
+    check_decay(100, 33.0, 20000, r);         // the first that draws gaps
+    check_decay(32, 5.0, 20000, r);           // 64 literals: exactly one full word
+    check_decay(33, 5.0, 20000, r);           // 66 literals: a second word with 2 literals
+    check_decay(784, 10.0, 6000, r);          // MNIST sized
+    check_decay(784, 100.0, 6000, r);         // p = 0.01
+    check_decay(784, 1000.0, 6000, r);        // p = 0.001
     print("all checks passed");
 }

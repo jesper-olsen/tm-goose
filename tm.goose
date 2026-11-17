@@ -29,10 +29,17 @@
 // underlying single-class step, usable directly (e.g. with n_classes = 1 as a binary
 // machine scored by `class_sum(m, 0) >= 0`).
 //
+// Type I feedback on a clause that did not fire (nine in ten of all Type I updates on MNIST) moves
+// each literal with probability 1/s. Instead of one random draw per literal it draws 64 coin flips
+// at a time from a few random words, or, for large s, the gaps between the literals that move
+// (see `decay_unfired`): the same distribution with several times fewer draws. With the
+// words the probability is rounded to a multiple of 2^-16 (`decay_probability`).
+//
 // `TM` is a root struct (independently sized arrays): keep it in a variable.
 namespace tm;
 
 import std;
+import math;
 
 root struct TM {
     n_features: i64 = 0,
@@ -173,25 +180,103 @@ fn predict(m: TM&, x: u64[:]) -> i64 {
     return best;
 }
 
+// ln(1 - p) for 0 < p < 1, accurate for tiny p as well.
+fn ln_one_minus(p: f64) -> f64 {
+    return if p < 1.0e-4 { -p * (1.0 + p * (0.5 + p / 3.0)) } else { log(1.0 - p) };
+}
+
+// Above this probability 1/s, `decay_unfired` flips its coins 64 at a time; below it, it draws the gaps
+// between the ones that move. The words cost about the same whatever s is, the gaps cost about 1/s,
+// and in measurements on 1568 literals they break even near s = 30.
+const WORDS_MIN_P = 1.0 / 32.0;
+
+// The probability with which `decay_unfired` actually moves each literal: 1/s, rounded to a
+// multiple of 2^-16 when it flips its coins 64 at a time, exactly 1/s otherwise.
+fn decay_probability(s: f64) -> f64 {
+    let p = 1.0 / s;
+    return if p >= WORDS_MIN_P { floor(p * 65536.0 + 0.5) / 65536.0 } else { p };
+}
+
+// A word of 64 independent coin flips, each 1 with probability pq / 2^16, for pq in 1..65535 and
+// tz = the number of trailing zero bits of pq. From the lowest set bit of pq upward, a 1 bit ORs in
+// a random word and a 0 bit ANDs one in: every step halves the probability built so far and a 1
+// bit then adds one half, which ends at exactly pq / 2^16. The zero bits below the lowest set bit
+// would only AND with zero, so they are skipped.
+fn bernoulli_word(pq: u64, tz: i64, r: rng&) -> u64 {
+    var w: u64 = 0;
+    for b in tz..16 {
+        let x = r.rand_u64();
+        w = if ((pq >> b) & 1) == 1 { w | x } else { w & x };
+    }
+    return w;
+}
+
+// Moves literal k of clause j one step towards "exclude" (state 1 is the end), keeping the mask in step.
+fn step_down(m: TM&, j: i64, k: i64) {
+    let i = j * 2 * m.n_features + k;
+    let st = m.state[i] as i64;
+    if st > 1 {
+        m.state[i] = (st - 1) as u8;
+        if st == m.n_states + 1 { clear_inc(m, j, k); }
+    }
+}
+
+// The part of Type I feedback for a clause that did not fire: each of its 2 * n_features literals
+// independently moves one step towards "exclude" with probability 1/s (see `decay_probability`).
+//
+// For 1/s >= WORDS_MIN_P the coins are flipped 64 at a time with `bernoulli_word`, and only the
+// literals that move are touched. For smaller 1/s it draws the number of literals to skip until the
+// next one that moves, a geometric variable (failures before the first success, success probability
+// p), floor(ln(u) / ln(1 - p)) for u uniform in (0, 1].
+fn decay_unfired(m: TM&, j: i64, r: rng&) {
+    let len = 2 * m.n_features;
+    let p = 1.0 / m.s;
+    if p >= WORDS_MIN_P {
+        let pq = (decay_probability(m.s) * 65536.0) as u64;   // 1/s rounded to 16 bits: 2048..65536
+        let tz = if pq >= 65536 { 0 } else { ctz(pq) };
+        let words = (len + 63) / 64;
+        for w in words {
+            var e: u64 = if pq >= 65536 { ~(0 as u64) } else { bernoulli_word(pq, tz, r) };
+            if w == words - 1 && (len & 63) != 0 { e &= ((1 as u64) << (len & 63)) - 1; }
+            while e != 0 {
+                step_down(m, j, w * 64 + ctz(e));
+                e &= e - 1;
+            }
+        }
+        return;
+    }
+    let ln_q = ln_one_minus(p);
+    var k = -1;                                   // the last literal looked at
+    while true {
+        let gap = floor(log(1.0 - r.rand_flt()) / ln_q);
+        if gap >= (len - 1 - k) { break; }        // the next one to move is past the last literal
+        k += 1 + gap as i64;
+        step_down(m, j, k);
+    }
+}
+
 // Type I feedback: reinforces clauses to recognize the example (used for y = 1 on
 // positive clauses and y = 0 on negative ones).
 fn type_i(m: TM&, j: i64, x: u64[:], r: rng&) {
+    if m.out[j] == 0 {
+        decay_unfired(m, j, r);
+        return;
+    }
+    // The clause fired: a true literal moves towards "include" with probability (s-1)/s, a
+    // false one towards "exclude" with probability 1/s.
     let n = m.n_features;
     let base = j * 2 * n;
     let top = 2 * m.n_states;
     let p_hit = (m.s - 1.0) / m.s;
     let p_miss = 1.0 / m.s;
-    let fired = m.out[j] == 1;
     for k in 2 * n {
         let st = m.state[base + k] as i64;
-        if fired && literal(x, n, k) == 1 {
-            // Clause true and literal true: move towards including it.
+        if literal(x, n, k) == 1 {
             if r.rand_flt() < p_hit && st < top {
                 m.state[base + k] = (st + 1) as u8;
                 if st == m.n_states { set_inc(m, j, k); }
             }
         } else {
-            // Otherwise: move towards excluding it.
             if r.rand_flt() < p_miss && st > 1 {
                 m.state[base + k] = (st - 1) as u8;
                 if st == m.n_states + 1 { clear_inc(m, j, k); }
