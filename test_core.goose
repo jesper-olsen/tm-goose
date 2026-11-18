@@ -108,6 +108,75 @@ fn check_decay(n: i64, s: f64, trials: i64, r: rng&) {
     check(str(tag, "joint moves at lags 1, 2, 7 and 64, worst |z| = ", worst_pair), worst_pair < 5.5);
 }
 
+// Runs `trials` Type I updates on a clause that fired, all of whose 2 * n literals start at state 5
+// (excluded, N = 10), on an input whose literals alternate true and false, and compares how they move
+// with the probabilities they should have: a true literal steps up with probability (s-1)/s (1 with
+// boost, which must never fail), a false one steps down with probability 1/s; nothing else may move.
+fn check_fired(n: i64, s: f64, boost: bool, trials: i64, r: rng&) {
+    var m = tm::TM { .. };
+    tm::init(m, n, 1, 1, 10, 5, s, r, boost);
+    var bits: u8[>..] = [];
+    for k in n { bits.push((k % 2) as u8); }                 // x_k = k mod 2, so literal k is true iff k is odd
+    var x: u64[>..] = [];
+    tm::pack(bits, x);
+    let len = 2 * n;
+    let p_up = if boost { 1.0 } else { (s - 1.0) / s };
+    let p_down = 1.0 / s;
+    var ups: i64[>..] = [];  ups.resize(len, 0);
+    var downs: i64[>..] = []; downs.resize(len, 0);
+    var stray = 0;                                           // moves that must never happen
+    for _ in trials {
+        for i in m.state.len { m.state[i] = 5; }
+        tm::rebuild_masks(m);
+        m.out[0] = 1;                                        // the clause fired
+        tm::type_i(m, 0, x, r);
+        for k in len {
+            let st = m.state[k];
+            let is_true = tm::literal(x, n, k) == 1;
+            if st == 6 { if is_true { ups[k] += 1; } else { stray++; } }
+            else if st == 4 { if is_true { stray++; } else { downs[k] += 1; } }
+            else if st != 5 { stray++; }
+        }
+    }
+    let tag = str("fired n=", n, " s=", s, " boost=", boost, ": ");
+    check(str(tag, "true literals only step up, false ones only down"), stray == 0);
+    let t = trials * 1.0;
+    var worst_up = 0.0;
+    var worst_down = 0.0;
+    var all_up = true;
+    for kind in 2 {                                          // 0: true literals (odd k), 1: false literals
+        let p = if kind == 0 { p_up } else { p_down };
+        let q = 1.0 - p;
+        var cells = 0;
+        var obs = 0;
+        var worst = 0.0;
+        var group_cells = 0;
+        var group_obs = 0;
+        var in_group = 0;
+        let group_size = if t * min(p, q) >= 100.0 { 1 } else { max(1, n / 16) };
+        for k in len {
+            let literal_true = tm::literal(x, n, k) == 1;
+            if literal_true != (kind == 0) { continue; }
+            let moved = if kind == 0 { ups[k] } else { downs[k] };
+            if kind == 0 && boost && moved != trials { all_up = false; }
+            group_cells += trials;
+            group_obs += moved;
+            in_group++;
+            if in_group == group_size {
+                if q > 0.0 {
+                    let z = abs(group_obs - group_cells * p) / sqrt(group_cells * p * q);
+                    if z > worst { worst = z; }
+                }
+                group_cells = 0; group_obs = 0; in_group = 0;
+            }
+        }
+        if kind == 0 { worst_up = worst; } else { worst_down = worst; }
+    }
+    if boost { check(str(tag, "with boost every true literal steps up in every trial"), all_up); }
+    else { check(str(tag, "true literals step up with probability (s-1)/s, worst |z| = ", worst_up), worst_up < 5.5); }
+    check(str(tag, "false literals step down with probability 1/s, worst |z| = ", worst_down), worst_down < 5.5);
+}
+
 fn main() {
     var r = rng { 7 };
     // two features: literals are [x0, x1, !x0, !x1]
@@ -390,5 +459,64 @@ fn main() {
     check_decay(784, 10.0, 6000, r);          // MNIST sized
     check_decay(784, 100.0, 6000, r);         // p = 0.01
     check_decay(784, 1000.0, 6000, r);        // p = 0.001
+
+    // ======================================================================== boost
+    // s ~ 1 makes (s-1)/s ~ 1e-7: without boost a true literal of a fired clause practically never
+    // steps up, with boost it always does; false literals decay the same either way.
+    let xb2: u8[2] = [1, 0];                                  // literals [x0, x1, !x0, !x1] = [1, 0, 0, 1]
+    var xb2p: u64[>..] = [];
+    tm::pack(xb2, xb2p);
+    var nb = tm::TM { .. }; setup(nb, 2, 1, 1.0000001, 5, r);
+    tm::evaluate(nb, xb2p, true);
+    tm::type_i(nb, 0, xb2p, r);
+    check("no boost, s ~ 1: true literals of a fired clause stay put", get(nb, 0, 0) == 5 && get(nb, 0, 3) == 5);
+    check("no boost, s ~ 1: false literals step down", get(nb, 0, 1) == 4 && get(nb, 0, 2) == 4);
+    var bb = tm::TM { .. }; setup(bb, 2, 1, 1.0000001, 5, r); bb.boost = true;
+    tm::evaluate(bb, xb2p, true);
+    tm::type_i(bb, 0, xb2p, r);
+    check("boost, s ~ 1: true literals step up", get(bb, 0, 0) == 6 && get(bb, 0, 3) == 6);
+    check("boost leaves false literals to the usual decay", get(bb, 0, 1) == 4 && get(bb, 0, 2) == 4);
+    var bt = tm::TM { .. }; setup(bt, 2, 1, 1.0000001, 5, r); bt.boost = true;
+    set(bt, 0, 0, 20); set(bt, 0, 3, 20);                     // the two true literals are included, at the top state 2N = 20
+    tm::evaluate(bt, xb2p, true);
+    check("(the clause fires: it includes only true literals)", bt.out[0] == 1);
+    tm::type_i(bt, 0, xb2p, r);
+    check("boost: states saturate at 2N", get(bt, 0, 0) == 20 && get(bt, 0, 3) == 20);
+    var bc = tm::TM { .. }; setup(bc, 2, 1, 1.0000001, 10, r); bc.boost = true;    // state N: the last excluded one
+    tm::evaluate(bc, xb2p, true);
+    tm::type_i(bc, 0, xb2p, r);
+    check("boost: a true literal crossing N + 1 is included and the mask follows",
+          get(bc, 0, 0) == 11 && tm::included(bc, 0, 0) && get(bc, 0, 3) == 11 && tm::included(bc, 0, 3) && !tm::included(bc, 0, 1));
+    var bu = tm::TM { .. }; setup(bu, 2, 1, 1.0000001, 5, r); bu.boost = true;
+    set(bu, 0, 1, 11);                                        // includes the false literal x1: the clause does not fire
+    tm::evaluate(bu, xb2p, true);
+    tm::type_i(bu, 0, xb2p, r);
+    check("boost does not touch an unfired clause: every automaton steps down",
+          bu.out[0] == 0 && get(bu, 0, 0) == 4 && get(bu, 0, 1) == 10 && get(bu, 0, 2) == 4 && get(bu, 0, 3) == 4);
+
+    check_fired(50, 3.9, false, 20000, r);
+    check_fired(50, 3.9, true, 20000, r);
+    check_fired(50, 10.0, false, 20000, r);
+    check_fired(50, 10.0, true, 20000, r);
+    check_fired(3, 2.0, false, 20000, r);
+    check_fired(3, 2.0, true, 20000, r);
+    check_fired(200, 40.0, false, 6000, r);                   // large s: a true literal fails to step up 1 time in 40
+    check_fired(200, 40.0, true, 6000, r);
+
+    // masks follow the states through training with boost, as without
+    var qb = tm::TM { .. };
+    tm::init(qb, 70, 1, 6, 4, 4, 2.0, r, true);
+    var consistent_boost = true;
+    for step in 400 {
+        var bits: u8[>..] = [];
+        for _ in 70 { bits.push(r.rand_int(2) as u8); }
+        var xq: u64[>..] = [];
+        tm::pack(bits, xq);
+        tm::update_class(qb, 0, xq, bits[0] ^ bits[1], r);
+        let saved = copy(qb.inc);
+        tm::rebuild_masks(qb);
+        if qb.inc != saved { consistent_boost = false; }
+    }
+    check("with boost the masks equal the ones rebuilt from the states after 400 updates", consistent_boost);
     print("all checks passed");
 }

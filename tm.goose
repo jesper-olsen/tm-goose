@@ -18,7 +18,7 @@
 // state crosses between n_states and n_states + 1.
 //
 //   var m = tm::TM { .. };
-//   tm::init(m, n_features, n_classes, n_clauses, n_states, threshold, s, r);
+//   tm::init(m, n_features, n_classes, n_clauses, n_states, threshold, s, r);   // optionally , boost = true
 //   var xs: u64[>..] = [];
 //   tm::pack(bits, xs);                  // appends tm::n_words(n_features) words
 //   tm::update(m, xs[i * w..(i + 1) * w], label, r);   // one example, label in 0..n_classes
@@ -28,6 +28,13 @@
 // other class, drawn by `negative_class`, gets y = 0 feedback. `update_class` is the
 // underlying single-class step, usable directly (e.g. with n_classes = 1 as a binary
 // machine scored by `class_sum(m, 0) >= 0`).
+//
+// With `boost`, a literal that is true in a clause that fired always moves one step towards
+// "include", instead of doing so with probability (s-1)/s. This is "Boosting of True Positive
+// Feedback" in Section 3.3.3 of Granmo's paper (arXiv:1804.01508), where (s-1)/s is replaced by
+// 1.0 and 1/s by 0.0 in column 1 of its Table 2; pyTsetlinMachine calls it
+// `boost_true_positive_feedback` and turns it on by default. Nothing else changes, and without
+// it the behaviour and the random stream are exactly as before.
 //
 // Type I feedback on a clause that did not fire (nine in ten of all Type I updates on MNIST) moves
 // each literal with probability 1/s. Instead of one random draw per literal it draws 64 coin flips
@@ -49,6 +56,7 @@ root struct TM {
     n_states: i64 = 0,       // N: automaton states per action; 1 <= N <= 127
     threshold: i64 = 0,      // T: votes are clipped to -T..T; larger T trains more clauses per example
     s: f64 = 1.0,            // specificity: larger s gives longer, more specific clauses
+    boost: bool = false,     // true literals of a fired clause always step towards include
     // Automaton states, one row of 2 * n_features per clause (clauses of class 0 first):
     // first the n_features literals x_k, then the n_features negated literals !x_k.
     state: u8[>..] = [],
@@ -108,7 +116,7 @@ fn rebuild_masks(m: TM&) {
     }
 }
 
-fn init(m: TM&, n_features: i64, n_classes: i64, n_clauses: i64, n_states: i64, threshold: i64, s: f64, r: rng&) {
+fn init(m: TM&, n_features: i64, n_classes: i64, n_clauses: i64, n_states: i64, threshold: i64, s: f64, r: rng&, boost: bool = false) {
     assert(n_features > 0 && n_classes > 0 && n_clauses > 0 && threshold > 0 && s > 1.0);
     assert(n_states >= 1 && n_states <= 127);
     m.n_features = n_features;
@@ -118,6 +126,7 @@ fn init(m: TM&, n_features: i64, n_classes: i64, n_clauses: i64, n_states: i64, 
     m.n_states = n_states;
     m.threshold = threshold;
     m.s = s;
+    m.boost = boost;
     m.state.clear();
     m.inc.clear();
     m.out.clear();
@@ -262,8 +271,8 @@ fn type_i(m: TM&, j: i64, x: u64[:], r: rng&) {
         decay_unfired(m, j, r);
         return;
     }
-    // The clause fired: a true literal moves towards "include" with probability (s-1)/s, a
-    // false one towards "exclude" with probability 1/s.
+    // The clause fired: a true literal moves towards "include" with probability (s-1)/s (always,
+    // with boost), a false one towards "exclude" with probability 1/s.
     let n = m.n_features;
     let base = j * 2 * n;
     let top = 2 * m.n_states;
@@ -272,7 +281,7 @@ fn type_i(m: TM&, j: i64, x: u64[:], r: rng&) {
     for k in 2 * n {
         let st = m.state[base + k] as i64;
         if literal(x, n, k) == 1 {
-            if r.rand_flt() < p_hit && st < top {
+            if (m.boost || r.rand_flt() < p_hit) && st < top {
                 m.state[base + k] = (st + 1) as u8;
                 if st == m.n_states { set_inc(m, j, k); }
             }
